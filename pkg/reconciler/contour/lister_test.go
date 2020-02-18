@@ -27,21 +27,26 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"knative.dev/serving/pkg/apis/networking/v1alpha1"
+	"knative.dev/serving/pkg/network"
+	servingnetwork "knative.dev/serving/pkg/network"
 	"knative.dev/serving/pkg/network/status"
 
 	"github.com/google/go-cmp/cmp"
+	"knative.dev/net-contour/pkg/reconciler/contour/config"
 	. "knative.dev/net-contour/pkg/reconciler/testing"
 )
 
 func TestListProbeTargets(t *testing.T) {
 	tests := []struct {
-		name    string
-		ing     *v1alpha1.Ingress
-		objects []runtime.Object
-		want    []status.ProbeTarget
-		wantErr error
+		name         string
+		httpProtocol network.HTTPProtocol
+		ing          *v1alpha1.Ingress
+		objects      []runtime.Object
+		want         []status.ProbeTarget
+		wantErr      error
 	}{{
-		name: "public with single address to probe",
+		name:         "public with single address to probe",
+		httpProtocol: network.HTTPEnabled,
 		objects: []runtime.Object{
 			publicService,
 			privateService,
@@ -59,7 +64,27 @@ func TestListProbeTargets(t *testing.T) {
 			}},
 		}},
 	}, {
-		name: "public with multiple addresses and subsets to probe",
+		name:         "public secure with single address to probe",
+		httpProtocol: network.HTTPDisabled,
+		objects: []runtime.Object{
+			publicSecureService,
+			privateService,
+			publicEndpointsOneAddr,
+			privateEndpointsNoAddr,
+		},
+		ing: ing("name", "ns", withBasicSpec, withContour),
+		want: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("1.2.3.4"),
+			Port:    "443",
+			PodPort: "1234",
+			URLs: []*url.URL{{
+				Scheme: "https",
+				Host:   "example.com",
+			}},
+		}},
+	}, {
+		name:         "public with multiple addresses and subsets to probe",
+		httpProtocol: network.HTTPEnabled,
 		objects: []runtime.Object{
 			publicService,
 			privateService,
@@ -85,6 +110,33 @@ func TestListProbeTargets(t *testing.T) {
 			}},
 		}},
 	}, {
+		name:         "public secure with multiple addresses and subsets to probe",
+		httpProtocol: network.HTTPDisabled,
+		objects: []runtime.Object{
+			publicSecureService,
+			privateService,
+			publicEndpointsMultiAddrMultiSubset,
+			privateEndpointsNoAddr,
+		},
+		ing: ing("name", "ns", withBasicSpec, withContour),
+		want: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("2.3.4.5"),
+			Port:    "443",
+			PodPort: "1234",
+			URLs: []*url.URL{{
+				Scheme: "https",
+				Host:   "example.com",
+			}},
+		}, {
+			PodIPs:  sets.NewString("3.4.5.6", "4.3.2.1"),
+			Port:    "443",
+			PodPort: "4321",
+			URLs: []*url.URL{{
+				Scheme: "https",
+				Host:   "example.com",
+			}},
+		}},
+	}, {
 		name:    "no public service",
 		objects: []runtime.Object{},
 		ing:     ing("name", "ns", withBasicSpec, withContour),
@@ -95,16 +147,18 @@ func TestListProbeTargets(t *testing.T) {
 		ing:     ing("name", "ns", withBasicSpec, withContour),
 		wantErr: fmt.Errorf("failed to get Endpoints: endpoints %q not found", publicName),
 	}, {
-		name:    "no port 80 in service",
-		objects: []runtime.Object{publicServiceNoPort80, publicEndpointsOneAddr},
-		ing:     ing("name", "ns", withBasicSpec, withContour),
+		name:         "no port 80 in service",
+		httpProtocol: network.HTTPEnabled,
+		objects:      []runtime.Object{publicServiceNoPort80, publicEndpointsOneAddr},
+		ing:          ing("name", "ns", withBasicSpec, withContour),
 		wantErr: fmt.Errorf("failed to lookup port 80 in %s/%s: no port with number 80 found",
 			publicNS, publicName),
 	}, {
-		name:    "no matching port name in endpoints",
-		objects: []runtime.Object{publicService, publicEndpointsWrongPortName},
-		ing:     ing("name", "ns", withBasicSpec, withContour),
-		wantErr: fmt.Errorf(`failed to lookup port name "asdf" in endpoints subset for %s/%s: no port for name "asdf" found`, publicNS, publicName),
+		name:         "no matching port name in endpoints",
+		httpProtocol: network.HTTPEnabled,
+		objects:      []runtime.Object{publicService, publicEndpointsWrongPortName},
+		ing:          ing("name", "ns", withBasicSpec, withContour),
+		wantErr:      fmt.Errorf(`failed to lookup port name "asdf" in endpoints subset for %s/%s: no port for name "asdf" found`, publicNS, publicName),
 	}}
 
 	for _, test := range tests {
@@ -116,7 +170,19 @@ func TestListProbeTargets(t *testing.T) {
 				EndpointsLister: tl.GetEndpointsLister(),
 			}
 
-			ctx := (&testConfigStore{config: defaultConfig}).ToContext(context.Background())
+			testConfig := &config.Config{
+				Contour: &config.Contour{
+					VisibilityKeys: map[v1alpha1.IngressVisibility]sets.String{
+						v1alpha1.IngressVisibilityClusterLocal: sets.NewString(privateKey),
+						v1alpha1.IngressVisibilityExternalIP:   sets.NewString(publicKey),
+					},
+				},
+				Network: &servingnetwork.Config{
+					AutoTLS:      false,
+					HTTPProtocol: test.httpProtocol,
+				},
+			}
+			ctx := (&testConfigStore{config: testConfig}).ToContext(context.Background())
 
 			got, gotErr := l.ListProbeTargets(ctx, test.ing)
 			if (gotErr != nil) != (test.wantErr != nil) {
@@ -145,6 +211,18 @@ var (
 			}},
 		},
 	}
+	publicSecureService = &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: publicNS,
+			Name:      publicName,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{
+				Name: "asdf",
+				Port: 443,
+			}},
+		},
+	}
 	publicServiceNoPort80 = &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: publicNS,
@@ -154,6 +232,18 @@ var (
 			Ports: []corev1.ServicePort{{
 				Name: "asdf",
 				Port: 81,
+			}},
+		},
+	}
+	publicSecureServiceNoPort443 = &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: publicNS,
+			Name:      publicName,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{
+				Name: "asdf",
+				Port: 442,
 			}},
 		},
 	}

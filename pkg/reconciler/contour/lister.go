@@ -43,6 +43,15 @@ var _ status.ProbeTargetLister = (*lister)(nil)
 func (l *lister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) ([]status.ProbeTarget, error) {
 	var results []status.ProbeTarget
 
+	// work out port number and url scheme based on HTTPProtocol config
+	httpProtocol := config.FromContext(ctx).Network.HTTPProtocol
+	svcPortNumber := 80
+	scheme := "http"
+	if httpProtocol != network.HTTPEnabled {
+		svcPortNumber = 443
+		scheme = "https"
+	}
+
 	visibilityKeys := config.FromContext(ctx).Contour.VisibilityKeys
 	for key, hosts := range ingress.HostsPerVisibility(ing, visibilityKeys) {
 		namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -63,15 +72,14 @@ func (l *lister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) ([
 		urls := make([]*url.URL, 0, hosts.Len())
 		for _, host := range hosts.UnsortedList() {
 			urls = append(urls, &url.URL{
-				Scheme: "http",
+				Scheme: scheme,
 				Host:   host,
 			})
 		}
 
-		// TODO(mattmoor): Perhaps key off of whether HTTP is enabled?
-		portName, err := network.NameForPortNumber(service, 80)
+		portName, err := network.NameForPortNumber(service, int32(svcPortNumber))
 		if err != nil {
-			return nil, fmt.Errorf("failed to lookup port 80 in %s/%s: %v", namespace, name, err)
+			return nil, fmt.Errorf("failed to lookup port %d in %s/%s: %v", svcPortNumber, namespace, name, err)
 		}
 		for _, sub := range endpoints.Subsets {
 			portNumber, err := network.PortNumberForName(sub, portName)
@@ -82,7 +90,7 @@ func (l *lister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) ([
 
 			pt := status.ProbeTarget{
 				PodIPs:  sets.NewString(),
-				Port:    "80",
+				Port:    strconv.Itoa(int(svcPortNumber)),
 				PodPort: strconv.Itoa(int(portNumber)),
 				URLs:    urls,
 			}
@@ -91,7 +99,6 @@ func (l *lister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) ([
 			}
 			results = append(results, pt)
 		}
-
 	}
 
 	return results, nil
